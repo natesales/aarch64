@@ -41,7 +41,7 @@ func handleMessage(m *nsq.Message) error {
 	log.Printf("Received message: %s\n", m.Body)
 
 	if msg.Action == message.NewVMState {
-		objID, err := primitive.ObjectIDFromHex(msg.Data.Name)
+		objID, err := primitive.ObjectIDFromHex(msg.MessageData.Name)
 		if err != nil {
 			log.Println(err)
 			return nil
@@ -52,7 +52,7 @@ func handleMessage(m *nsq.Message) error {
 			bson.M{"_id": objID},
 			bson.M{
 				"$set": bson.M{
-					"state": msg.Data.Num,
+					"state": msg.MessageData.Num,
 				},
 			},
 		)

@@ -54,7 +54,7 @@ func (h *NSQHandler) HandleMessage(m *nsq.Message) error {
 	}
 
 	// Name and IP Should Not be Empty
-	if msg.Data.Name == "" || msg.Data.IP == "" {
+	if msg.MessageData.Name == "" || msg.MessageData.IP == "" {
 		h.l.Error("name or ip is empty")
 		return nil
 	}
@@ -63,13 +63,13 @@ func (h *NSQHandler) HandleMessage(m *nsq.Message) error {
 	h.mutex.Lock()
 	switch msg.Action {
 	case message.AddProxy:
-		h.addProxy(&msg.Data)
+		h.addProxy(&msg.MessageData)
 		h.GenerateConfig()
 		h.SaveProxies()
 		h.ReloadProxy()
 		break
 	case message.DeleteProxy:
-		h.deleteProxy(&msg.Data)
+		h.deleteProxy(&msg.MessageData)
 		h.GenerateConfig()
 		h.SaveProxies()
 		h.ReloadProxy()
@@ -184,6 +184,7 @@ func main() {
 	nh.GenerateConfig()
 	nh.ReloadProxy()
 	nsqConsumer := commons.CreateNSQConsumer(nsqConnectURI, "aarch64-proxy", hostname, nh)
+	l.Info("Successfully Connected to NSQ")
 	defer nsqConsumer.Stop()
 	l.Info("Beryllium has Started!!!")
 

@@ -1,5 +1,28 @@
 package message
 
+type VMData struct {
+	ID          string `bson:"_id" json:"_id"`
+	Hostname    string `bson:"hostname" json:"hostname"`
+	Pop         string `bson:"pop" json:"pop"`
+	Project     string `bson:"project" json:"project"`
+	Os          string `bson:"os" json:"os"`
+	Vcpus       int    `bson:"vcpus" json:"vcpus"`
+	Memory      int    `bson:"memory" json:"memory"`
+	Ssd         int    `bson:"ssd" json:"ssd"`
+	Host        int    `bson:"host" json:"host"`
+	Password    int    `bson:"password" json:"password"`
+	Phoned_home bool   `bson:"phoned_home" json:"phoned_home"`
+	Created     struct {
+		By string  `bson:"by"`
+		At float64 `bson:"at"` // unix timestamp
+	} `bson:"created"`
+	Index   int    `bson:"index"`
+	Prefix  string `bson:"prefix"`
+	Gateway string `bson:"gateway"`
+	Address string `bson:"address"`
+	State   int    `bson:"state"`
+}
+
 type MessageData struct {
 	Name   string      `json:"name"`
 	Source string      `json:"source"`
@@ -17,9 +40,10 @@ type ErrorMessage struct {
 }
 
 type Message struct {
-	ID     int64       `json:"id"`
-	Action Action      `json:"action"`
-	Data   MessageData `json:"data"`
+	ID          int64       `json:"id"`
+	Action      Action      `json:"action"`
+	MessageData MessageData `json:"message_data"`
+	VMData      VMData      `json:"vm_data"`
 }
 
 type Action int64

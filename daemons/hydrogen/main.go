@@ -2,175 +2,195 @@ package main
 
 import (
 	"context"
-	"encoding/json"
 	"flag"
-	"log"
 	"net"
 	"os"
 	"os/signal"
-	"syscall"
+	"sync"
 	"time"
 
 	"github.com/bwmarrin/snowflake"
 	"github.com/digitalocean/go-libvirt"
 	"github.com/fosshostorg/aarch64/daemons/internal/commons"
 	"github.com/fosshostorg/aarch64/daemons/internal/message"
+	jsoniter "github.com/json-iterator/go"
 	"github.com/nsqio/go-nsq"
+	"go.uber.org/zap"
 )
 
-func handleMessage(m *nsq.Message) error {
-	if len(m.Body) == 0 {
-		// Returning nil will automatically send a FIN command to NSQ to mark the message as processed.
+var json = jsoniter.ConfigCompatibleWithStandardLibrary
+
+func NewNSQHandler(l *zap.Logger, p *nsq.Producer, virt *libvirt.Libvirt, sfn *snowflake.Node) *NSQHandler {
+	return &NSQHandler{
+		l:       l,
+		p:       p,
+		virt:    virt,
+		sfn:     sfn,
+		seenIds: make(map[int64]bool),
+		mutex:   sync.Mutex{},
+	}
+}
+
+type NSQHandler struct {
+	l       *zap.Logger
+	p       *nsq.Producer
+	virt    *libvirt.Libvirt
+	sfn     *snowflake.Node
+	seenIds map[int64]bool
+	mutex   sync.Mutex
+}
+
+func (h *NSQHandler) HandleMessage(m *nsq.Message) error {
+	// Message Body Should Not be Empty
+	if m.Body == nil || len(m.Body) <= 0 {
+		h.l.Error("message body is empty")
 		return nil
 	}
 
+	// Decode Message Body
 	var msg message.Message
 	if err := json.Unmarshal(m.Body, &msg); err != nil {
-		log.Printf("Invalid NSQ Message: %s\n", m.Body)
-		return nil
-		// No point in even returning an error if we can't unmarshal the message as we don't want that requeued.
-	}
-
-	// NSQ does not guarantee messages are not duplicated. We'll check
-	if seenIDs[msg.ID] {
-		log.Printf("Dropped duplicate message, ID %d\n", msg.ID) // No need to send this to the error logger, it's natural
+		h.l.Error("failed to unmarshal message", zap.Error(err))
 		return nil
 	}
-	seenIDs[msg.ID] = true
 
-	var vm libvirt.Domain
-
-	// If there is a VMName lets get the vm
-	if msg.Data.Name != "" {
-		tvm, err := lbvt.DomainLookupByName(msg.Data.Name)
-		if err != nil {
-			log.Printf("%s\n", err) // This error already says everything to be said
-			return nil
-		}
-		vm = tvm
+	// h.mutex.Lock()
+	// Ensure Duplicate Messaages are Deleted
+	if h.seenIds[msg.ID] {
+		h.l.Error("duplicate message", zap.Int64("message_id", msg.ID))
+		return nil
 	}
+	h.seenIds[msg.ID] = true
 
+	// Handle Message Actions
 	switch msg.Action {
+	// TODO Add and Remove Domains
 	case message.ChangeState:
-		if msg.Data.Name == "" {
-			// We should have a producer output to a logs place for this kind of stuff
-			return nil
-		}
-		// Change the state of the VM
-		switch msg.Data.Event {
-		case message.StateShutdown:
-			lbvt.DomainShutdown(vm)
-		case message.StateReboot:
-			lbvt.DomainReboot(vm, libvirt.DomainRebootDefault)
-		case message.StateReset:
-			lbvt.DomainReset(vm, 0)
-		case message.StateStartup:
-			lbvt.DomainCreate(vm)
-		case message.StateStop:
-			lbvt.DomainDestroy(vm)
-		default:
-			// We should have a producer output to a logs place for this kind of stuff
-			log.Printf("Unknown state %d provided to changeState\n", msg.Data.Event)
-		}
+		msgData := &msg.MessageData
+		h.changeDomainState(msgData)
 	}
 
+	// h.mutex.Unlock()
 	return nil
 }
 
-func monitorVMStatus(ctx context.Context, snow *snowflake.Node) {
-	events, _ := lbvt.LifecycleEvents(ctx)
-	for event := range events {
-		switch libvirt.DomainEventType(event.Event) {
+func (h *NSQHandler) MonitorDomainStatus(ctx context.Context) error {
+	events, err := h.virt.LifecycleEvents(ctx)
+	if err != nil {
+		h.l.Error("unable to monitor domain status", zap.Error(err))
+		return nil
+	}
+	for e := range events {
+		switch libvirt.DomainEventType(e.Event) {
 		case libvirt.DomainEventStarted:
 			msg := message.Message{
-				ID:     int64(snow.Generate()),
+				ID:     int64(h.sfn.Generate()),
 				Action: message.NewVMState,
-				Data: message.MessageData{
-					Name: event.Dom.Name,
+				MessageData: message.MessageData{
+					Name: e.Dom.Name,
 					Num:  1,
 				},
 			}
-			commons.ProducerSendStruct(msg, "aarch64-power", apiProducer)
+			commons.ProducerSendStruct(msg, "aarch64-power", h.p)
 		case libvirt.DomainEventStopped:
 			msg := message.Message{
-				ID:     int64(snow.Generate()),
+				ID:     int64(h.sfn.Generate()),
 				Action: message.NewVMState,
-				Data: message.MessageData{
-					Name: event.Dom.Name,
+				MessageData: message.MessageData{
+					Name: e.Dom.Name,
 					Num:  5,
 				},
 			}
-			commons.ProducerSendStruct(msg, "aarch64-power", apiProducer)
+			commons.ProducerSendStruct(msg, "aarch64-power", h.p)
 		}
 	}
+	return nil
 }
 
-func connectToLibVirt() *libvirt.Libvirt {
-	// Lets handle the libvirt stuff first
-	c, err := net.DialTimeout("unix", "/var/run/libvirt/libvirt-sock", 2*time.Second)
-	if err != nil {
-		log.Printf("Could not connect to libvirt socket: %s\n", err)
+func (h *NSQHandler) changeDomainState(data *message.MessageData) error {
+	// Locate Domain for Operations
+	var domain libvirt.Domain
+	if data.Name != "" {
+		tDomain, err := h.virt.DomainLookupByName(data.Name)
+		if err != nil {
+			h.l.Error(
+				"unable to locate domain",
+				zap.String("name", data.Name),
+				zap.Error(err),
+			)
+			return nil
+		}
+		domain = tDomain
 	}
-
-	l := libvirt.New(c)
-	if err := l.Connect(); err != nil {
-		log.Printf("Could not connect to libvirt: %s\n", err)
+	// Handle Domain State Changes
+	switch data.Event {
+	case message.StateShutdown:
+		h.virt.DomainShutdown(domain)
+	case message.StateReboot:
+		h.virt.DomainReboot(domain, libvirt.DomainRebootDefault)
+	case message.StateReset:
+		h.virt.DomainReset(domain, 0)
+	case message.StateStartup:
+		h.virt.DomainCreate(domain)
+	case message.StateStop:
+		h.virt.DomainDestroy(domain)
+	default:
+		h.l.Error("unknown state change event")
 	}
-
-	log.Printf("Connected to libvirt\n")
-	return l
+	return nil
 }
-
-// Let's define our variables needed through the program
-var (
-	lbvt        *libvirt.Libvirt
-	seenIDs     = make(map[int64]bool)
-	hostname    string
-	apiProducer *nsq.Producer
-)
 
 func main() {
+	l, _ := zap.NewDevelopment()
+
+	// Flag Variables
+	var (
+		nsqConnectURI string
+	)
+
+	// Parse Flags
+	flag.StringVar(&nsqConnectURI, "nsq-connect-uri", commons.NSQCoreUrl, "The URI for NSQ producers & consumers to connect to")
 	flag.Parse()
-	lbvt = connectToLibVirt()
-	defer lbvt.Disconnect()
-	hostname := commons.GetHostname()
-	snow := commons.GetSnow()
-	nsqConnectURI := *flag.String("nsq-connect-uri", commons.NSQCoreUrl, "The URI for NSQ producers & consumers to connect to")
 
-	// Set seenID to true so that packets without an ID get dropped
-	seenIDs[0] = true
-
-	// Create the apiProducer
-	var err error
-	apiProducer, err = nsq.NewProducer(nsqConnectURI, nsq.NewConfig())
+	// Connect to LibVirt
+	lvc, err := net.DialTimeout("unix", "/var/run/libvirt/libvirt-sock", 2*time.Second)
 	if err != nil {
-		log.Printf("Could not connect to NSQ: %s\n", err)
+		l.Fatal("unable to connect to libvirt socket", zap.Error(err))
 	}
-	defer apiProducer.Stop()
-
-	// Time for NSQ
-	hostControlConsumer := commons.CreateNSQConsumer(nsqConnectURI, "aarch64-libvirt-"+hostname, "main", nsq.HandlerFunc(handleMessage))
-	defer hostControlConsumer.Stop()
-
-	// Let's allow our queues to drain properly during shutdown.
-	// We'll create a channel to listen for SIGINT (Ctrl+C) to signal
-	// to our application to gracefully shutdown.
-	shutdown := make(chan os.Signal, 2)
-	signal.Notify(shutdown, syscall.SIGINT)
-
-	// This is our main loop. It will continue to read off of our nsq
-	// channel until either the consumer dies or our application is signaled
-	// to stop.
-	monitorCTX := context.Background()
-	go monitorVMStatus(monitorCTX, snow)
-	defer monitorCTX.Done()
-
-	for {
-		select {
-		case <-hostControlConsumer.StopChan:
-			return
-		case <-shutdown:
-			return
-		}
+	lv := libvirt.New(lvc)
+	if err := lv.Connect(); err != nil {
+		l.Fatal("unable to connect to libvirt socket", zap.Error(err))
 	}
+	l.Info("Successfully Connected to LibVirt")
+
+	// Create Snowflake Node
+	sfNode := commons.GetSnow()
+
+	// Connect to NSQ
+	hostname := commons.GetHostname()
+	if hostname == "" {
+		l.Fatal("failed to read hostname")
+	}
+	nsqProducer, err := nsq.NewProducer(nsqConnectURI, nsq.NewConfig())
+	if err != nil {
+		l.Fatal("unable to connect to NSQ", zap.Error(err))
+	}
+	nh := NewNSQHandler(l, nsqProducer, lv, sfNode)
+	nsqConsumer := commons.CreateNSQConsumer(nsqConnectURI, "aarch64-libvirt-"+hostname, "main", nh)
+	l.Info("Successfully Connected to NSQ")
+	defer nsqConsumer.Stop()
+
+	// Start Domain Monitor
+	ctx := context.Background()
+	go nh.MonitorDomainStatus(ctx)
+	defer ctx.Done()
+
+	l.Info("Hydrogen has Started!!!")
+
+	// Handle Shutting Down
+	c := make(chan os.Signal, 1)
+	signal.Notify(c, os.Interrupt)
+	signal.Notify(c, os.Kill)
+	<-c
+	l.Info("Hydrogen Shutting Down...Byeeee")
 }
